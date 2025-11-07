@@ -2,13 +2,28 @@ import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
+import { z } from 'zod';
 
 const app = express();
-app.use(cors({ origin: '*' }));
-app.use(express.json());
 
 // ============================================
-// LOGGING UTILITIES
+// ENVIRONMENT & SECURITY CONFIGURATION
+// ============================================
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const PORT = process.env.PORT || 3001;
+const IS_PRODUCTION = NODE_ENV === 'production';
+
+// CORS Configuration - Restrict origins in production
+const allowedOrigins = IS_PRODUCTION 
+  ? [
+      'https://tuapp.com',
+      'https://www.tuapp.com',
+      // Agrega aquí tus dominios de producción
+    ]
+  : ['http://localhost:5173', 'http://localhost:3000']; // Development
+
+// ============================================
+// LOGGING UTILITIES (Must be defined early)
 // ============================================
 const log = {
   info: (msg, data = {}) => console.log(`ℹ️  [INFO] ${msg}`, data),
@@ -19,6 +34,69 @@ const log = {
   socket: (msg, data = {}) => console.log(`🔌 [SOCKET] ${msg}`, data),
   api: (method, path, status, data = {}) => console.log(`📡 [API] ${method} ${path} → ${status}`, data)
 }
+
+app.use(cors({ 
+  origin: IS_PRODUCTION ? allowedOrigins : '*',
+  credentials: true 
+}));
+
+log.info(`CORS configured for ${NODE_ENV}`, { 
+  allowedOrigins: IS_PRODUCTION ? allowedOrigins : 'ALL (*)'
+});
+
+app.use(express.json({ limit: '1mb' })); // Limit payload size
+
+// ============================================
+// VALIDATION SCHEMAS (Zod)
+// ============================================
+
+// Point schema
+const PointSchema = z.object({
+  x: z.number().int().min(0).max(600),
+  y: z.number().int().min(0).max(400)
+});
+
+// Blueprint creation schema
+const CreateBlueprintSchema = z.object({
+  author: z.string().min(1).max(50).regex(/^[a-zA-Z0-9_-]+$/, 'Author must be alphanumeric'),
+  name: z.string().min(1).max(100).regex(/^[a-zA-Z0-9_-]+$/, 'Name must be alphanumeric'),
+  points: z.array(PointSchema).optional().default([])
+});
+
+// Blueprint update schema
+const UpdateBlueprintSchema = z.object({
+  points: z.array(PointSchema).max(1000, 'Maximum 1000 points allowed')
+});
+
+// Draw event schema
+const DrawEventSchema = z.object({
+  author: z.string().min(1).max(50),
+  name: z.string().min(1).max(100),
+  point: PointSchema,
+  room: z.string().optional()
+});
+
+// Validation middleware factory
+const validate = (schema) => (req, res, next) => {
+  try {
+    const validated = schema.parse(req.body);
+    req.body = validated; // Replace with validated data
+    log.debug('Payload validated successfully');
+    next();
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      log.warn('Validation failed', { errors: error.errors });
+      return res.status(400).json({ 
+        error: 'Validation failed',
+        details: error.errors.map(e => ({
+          field: e.path.join('.'),
+          message: e.message
+        }))
+      });
+    }
+    next(error);
+  }
+};
 
 // Request logging middleware
 app.use((req, res, next) => {
@@ -107,6 +185,13 @@ app.get('/metrics', (req, res) => {
 // GET all blueprints by author
 app.get('/api/blueprints/:author', (req, res) => {
   const { author } = req.params;
+  
+  // Validate author parameter
+  if (!author || !/^[a-zA-Z0-9_-]+$/.test(author)) {
+    log.warn('Invalid author parameter', { author });
+    return res.status(400).json({ error: 'Invalid author name' });
+  }
+  
   const authorBlueprints = [];
   
   blueprints.forEach((bp, key) => {
@@ -122,6 +207,15 @@ app.get('/api/blueprints/:author', (req, res) => {
 // GET specific blueprint
 app.get('/api/blueprints/:author/:name', (req, res) => {
   const { author, name } = req.params;
+  
+  // Validate parameters
+  if (!author || !/^[a-zA-Z0-9_-]+$/.test(author)) {
+    return res.status(400).json({ error: 'Invalid author name' });
+  }
+  if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
+    return res.status(400).json({ error: 'Invalid blueprint name' });
+  }
+  
   const key = getBpKey(author, name);
   const bp = blueprints.get(key);
   
@@ -134,14 +228,9 @@ app.get('/api/blueprints/:author/:name', (req, res) => {
   }
 });
 
-// POST - Create new blueprint
-app.post('/api/blueprints', (req, res) => {
-  const { author, name, points = [] } = req.body;
-  
-  if (!author || !name) {
-    log.warn('Validation failed: missing author or name', req.body);
-    return res.status(400).json({ error: 'Author and name are required' });
-  }
+// POST - Create new blueprint (WITH VALIDATION)
+app.post('/api/blueprints', validate(CreateBlueprintSchema), (req, res) => {
+  const { author, name, points } = req.body; // Already validated by middleware
   
   const key = getBpKey(author, name);
   
@@ -162,14 +251,17 @@ app.post('/api/blueprints', (req, res) => {
   res.status(201).json(newBp);
 });
 
-// PUT - Update/Save blueprint
-app.put('/api/blueprints/:author/:name', (req, res) => {
+// PUT - Update/Save blueprint (WITH VALIDATION)
+app.put('/api/blueprints/:author/:name', validate(UpdateBlueprintSchema), (req, res) => {
   const { author, name } = req.params;
-  const { points } = req.body;
+  const { points } = req.body; // Already validated by middleware
   
-  if (!points || !Array.isArray(points)) {
-    log.warn('Validation failed: invalid points array', req.body);
-    return res.status(400).json({ error: 'Points array is required' });
+  // Validate parameters
+  if (!author || !/^[a-zA-Z0-9_-]+$/.test(author)) {
+    return res.status(400).json({ error: 'Invalid author name' });
+  }
+  if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
+    return res.status(400).json({ error: 'Invalid blueprint name' });
   }
   
   const key = getBpKey(author, name);
@@ -189,6 +281,15 @@ app.put('/api/blueprints/:author/:name', (req, res) => {
 // DELETE blueprint
 app.delete('/api/blueprints/:author/:name', (req, res) => {
   const { author, name } = req.params;
+  
+  // Validate parameters
+  if (!author || !/^[a-zA-Z0-9_-]+$/.test(author)) {
+    return res.status(400).json({ error: 'Invalid author name' });
+  }
+  if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
+    return res.status(400).json({ error: 'Invalid blueprint name' });
+  }
+  
   const key = getBpKey(author, name);
   
   if (!blueprints.has(key)) {
@@ -207,7 +308,13 @@ app.delete('/api/blueprints/:author/:name', (req, res) => {
 });
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, { 
+  cors: { 
+    origin: IS_PRODUCTION ? allowedOrigins : '*',
+    credentials: true
+  },
+  maxHttpBufferSize: 1e6 // 1MB max message size
+});
 
 // Track connected clients
 let connectedClients = 0;
@@ -222,34 +329,61 @@ io.on('connection', (socket) => {
   });
   
   socket.on('join-room', (room) => {
+    // Validate room name
+    if (typeof room !== 'string' || !/^blueprints\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+$/.test(room)) {
+      log.warn(`Invalid room name: ${room}`);
+      socket.emit('error', { message: 'Invalid room name' });
+      return;
+    }
+    
     socket.join(room);
     clientRooms.get(socket.id).add(room);
     const roomSize = io.sockets.adapter.rooms.get(room)?.size || 0;
     log.socket(`Client ${socket.id} joined room: ${room}`, { roomSize });
   });
   
-  socket.on('draw-event', ({ room, point, author, name }) => {
-    const key = getBpKey(author, name);
-    const bp = blueprints.get(key) || { author, name, points: [] };
-    
-    // Add the new point
-    bp.points.push(point);
-    blueprints.set(key, bp);
-    
-    log.debug(`Point added to ${author}/${name}`, { 
-      point, 
-      totalPoints: bp.points.length,
-      room 
-    });
-    
-    // Broadcast to all clients in the room (including sender)
-    io.to(room).emit('blueprint-update', { author, name, points: bp.points });
-    
-    const roomSize = io.sockets.adapter.rooms.get(room)?.size || 0;
-    log.socket(`Broadcasted draw-event to room: ${room}`, { 
-      recipients: roomSize,
-      totalPoints: bp.points.length 
-    });
+  socket.on('draw-event', (data) => {
+    // Validate draw event data
+    try {
+      const validated = DrawEventSchema.parse(data);
+      const { room, point, author, name } = validated;
+      
+      const key = getBpKey(author, name);
+      const bp = blueprints.get(key) || { author, name, points: [] };
+      
+      // Prevent too many points
+      if (bp.points.length >= 1000) {
+        log.warn(`Blueprint ${author}/${name} has reached max points`);
+        socket.emit('error', { message: 'Maximum points limit reached' });
+        return;
+      }
+      
+      // Add the new point
+      bp.points.push(point);
+      blueprints.set(key, bp);
+      
+      log.debug(`Point added to ${author}/${name}`, { 
+        point, 
+        totalPoints: bp.points.length,
+        room 
+      });
+      
+      // Broadcast to all clients in the room (including sender)
+      io.to(room).emit('blueprint-update', { author, name, points: bp.points });
+      
+      const roomSize = io.sockets.adapter.rooms.get(room)?.size || 0;
+      log.socket(`Broadcasted draw-event to room: ${room}`, { 
+        recipients: roomSize,
+        totalPoints: bp.points.length 
+      });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        log.warn('Invalid draw-event data', { errors: error.errors });
+        socket.emit('error', { message: 'Invalid draw event data' });
+      } else {
+        log.error('Error processing draw-event', error);
+      }
+    }
   });
   
   socket.on('disconnect', (reason) => {
@@ -268,14 +402,15 @@ io.on('connection', (socket) => {
   });
 });
 
-const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log('\n' + '='.repeat(60));
   log.success(`🚀 Socket.IO Server running on port ${PORT}`);
+  log.info(`🌍 Environment: ${NODE_ENV}`);
+  log.info(`🔒 CORS: ${IS_PRODUCTION ? 'RESTRICTED to ' + allowedOrigins.join(', ') : 'OPEN (development)'}`);
   log.info(`📡 REST API available at http://localhost:${PORT}/api`);
   log.info(`🏥 Health check: http://localhost:${PORT}/health`);
   log.info(`📊 Metrics: http://localhost:${PORT}/metrics`);
-  log.info(`🌐 CORS enabled for all origins`);
+  log.info(`✅ Payload validation: ENABLED (Zod)`);
   log.info(`💾 Using in-memory storage (${blueprints.size} blueprints loaded)`);
   console.log('='.repeat(60) + '\n');
 });
